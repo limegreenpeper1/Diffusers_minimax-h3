@@ -420,6 +420,34 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                     "anything else on a 24-48GB-class card."
                 )
 
+        # H3_KEEP_TRANSFORMER=1 のプロセスでは、この API から到達できる構成も
+        # runner の import 時ガードと同じ予算判定を通す必要がある。そうしないと、
+        # 例えば video_vae_fp16 を false にする (fp32 デコードピーク 16.29GB へ戻す)
+        # 変更が、import 時には収まっていた収支を実行時に踏み越えてしまう --
+        # そのときデコード窓で transformer を解放しないのは H3_KEEP_TRANSFORMER の
+        # 設計そのもの (runner.py の同フラグのコメント参照) なので、逃げ場がない。
+        # 判定関数は runner と共有し、**まだ適用していない**値を明示的に渡す。
+        if runner.H3_KEEP_TRANSFORMER:
+            budget_gb = runner._effective_vram_budget_gb()
+            needs = runner._residency_requirements_gb(
+                transformer_quant=new_transformer_quant,
+                video_vae_fp16=new_video_vae_fp16,
+                te_quant=new_te_quant,
+                te_prune=new_te_prune,
+                te_proj=bool(new_te_proj),
+            )
+            phase, peak_gb = max(needs.items(), key=lambda kv: kv[1])
+            if budget_gb is not None and peak_gb > budget_gb:
+                raise ValueError(
+                    f"この設定は H3_KEEP_TRANSFORMER=1 のプロセスでは適用できません: "
+                    f"{phase} 位相の所要 {peak_gb:.2f}GB が、このGPUの実効予算 "
+                    f"{budget_gb:.2f}GB を超えます。H3_KEEP_TRANSFORMER=1 はデコード窓でも "
+                    "transformer を解放しないため、この構成では収支が成立しません。"
+                    "video_vae_fp16=true (デコードピーク 16.29GB → 11.4GB)、te_proj=true "
+                    "(32B TE → 3.11GB)、transformer_quant=int8 (66.3GB → 34.03GB) の "
+                    "いずれかで予算を空けてください。"
+                )
+
         new_transformer_both_resident = new_transformer_quant == "int8" and not new_lowvram_any
 
         # turbo (instant-group) compatibility with the *new* reload config: reject the

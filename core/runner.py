@@ -12,6 +12,14 @@ Loading strategy (see dev_notes/handoff-minimax-h3.md and diffusers-server CLAUD
   the *active* one to GPU), so it would try to hold all ~144GB in RAM simultaneously --
   not possible here.
 
+- **Unified-memory boxes (GB10 / DGX Spark) break the premise above** (2026-08-12): there
+  VRAM and host RAM are one pool, so "resident on GPU" and "resident in RAM" subtract from
+  the same budget and none of the CPU-parking tricks below free anything. The saving grace
+  is that the pool is large (128.45GB): `none` mode's cycling peak (~78GB) and bnb-4bit's
+  steady state (~87GB) both fit. What does NOT fit is loading the transformer first and
+  then quantizing the 32B TE from its bf16 shards -- that got the process OOM-killed, and
+  is why `preload_all()` now loads the TE first and why `_preflight_room()` exists.
+
 There are two loading strategies, selected by the `H3_TE_QUANT` env var:
 
 `H3_TE_QUANT=none`: the two 66GB models cycle through GPU per request, with
@@ -38,7 +46,11 @@ There are two loading strategies, selected by the `H3_TE_QUANT` env var:
   resident in the `none` path) plus activation buffers within this card's ~95.6GB. So
   in this mode the VAEs are NOT permanently resident: they live on CPU by default and
   are moved to GPU only for their active phase (keyframe encode / video+audio decode),
-  then moved back to CPU right after.
+  then moved back to CPU right after. **Unified-memory boxes invert this** (2026-08-12,
+  `H3_VAE_RESIDENT="auto"`): parking on CPU frees nothing there, and the `.to(DEVICE)`
+  copy leaves the CPU original alive, so the round trip *raises* peak pressure by ~11GB
+  instead of lowering it -- so there the VAEs stay GPU-resident and `_vae_to_gpu`/
+  `_vae_to_cpu` become no-ops. See `H3_VAE_RESIDENT`'s own comment.
   A second, sharper constraint was found by measurement, not by the original estimate:
   transformer(66.3) + TE-nf4(21.0) + vae pair(11.0) = ~98.5GB *before* any decode
   activation buffer is even counted -- already over the card's ~95.6GB. Keeping all
@@ -102,6 +114,7 @@ There are two loading strategies, selected by the `H3_TE_QUANT` env var:
 """
 from __future__ import annotations
 
+import functools
 import gc
 import io
 import json
@@ -181,46 +194,6 @@ logger = logging.getLogger("minimax_h3.runner")
 MODEL_ID = "MiniMaxAI/MiniMax-H3"
 DEVICE = torch.device("cuda:0")
 CPU = torch.device("cpu")
-
-# ---------------------------------------------------------------------------
-# H3_VRAM_LIMIT_GB: このプロセスが計算用GPU上で確保できる VRAM の上限 (GB, 10進)。
-# 既定は空 = 無制限 (カード全部を使ってよい)。
-#
-# 用途1 **同居**: 同じGPUで ComfyUI や diffusers-server 等を並走させるとき、H3 が
-#   カードを食い尽くさないように上限を切る。96GB のカードでも「H3 には半分だけ」と
-#   いった運用ができる (例: H3_VRAM_LIMIT_GB=48)。上限を超える確保は PyTorch の
-#   キャッシングアロケータが OOM として弾くので、**同居相手のメモリを奪わない**。
-# 用途2 **低VRAM構成の検証**: `scripts/vram_ballast.py` はダミーテンソルを実際に確保
-#   して空きを減らす方式だが、こちらは1行で済み、確保もしない。ただし
-#   `torch.cuda.mem_get_info()` が返す空き容量やカード総容量の見え方は変わらない
-#   (バラストは変わる) ので、**容量を読んで分岐するコード**
-#   (`_te_external_usable_for()` の 24GB 判定など) の検証にはバラストを使うこと。
-#
-# 実装は `torch.cuda.set_per_process_memory_fraction()`。fraction はカード総容量に
-# 対する比なので、GB 指定を総容量で割って渡す。指定が総容量以上なら無意味なので警告
-# だけ出して素通しする。**予約ではなく上限**なので、使わない限りメモリは消費しない。
-H3_VRAM_LIMIT_GB = os.environ.get("H3_VRAM_LIMIT_GB", "").strip()
-if H3_VRAM_LIMIT_GB:
-    _limit_gb = float(H3_VRAM_LIMIT_GB)
-    if _limit_gb <= 0:
-        raise ValueError(f"H3_VRAM_LIMIT_GB must be positive, got {H3_VRAM_LIMIT_GB!r}")
-    if torch.cuda.is_available():
-        _total_gb = torch.cuda.get_device_properties(DEVICE.index or 0).total_memory / 1e9
-        if _limit_gb >= _total_gb:
-            logger.warning(
-                "H3_VRAM_LIMIT_GB=%.1f is at or above the card's %.1fGB -- no cap applied.",
-                _limit_gb, _total_gb,
-            )
-        else:
-            torch.cuda.set_per_process_memory_fraction(_limit_gb / _total_gb, DEVICE.index or 0)
-            logger.info(
-                "VRAM cap: this process may allocate at most %.1fGB of %.1fGB on %s "
-                "(fraction %.3f, H3_VRAM_LIMIT_GB). Exceeding it raises OOM instead of "
-                "taking memory from co-tenant processes.",
-                _limit_gb, _total_gb, DEVICE, _limit_gb / _total_gb,
-            )
-    else:
-        logger.warning("H3_VRAM_LIMIT_GB set but CUDA is unavailable -- ignored.")
 
 # "none" (default) = current per-request TE<->transformer GPU swap.
 # "bnb-4bit" = TE quantized NF4, TE+transformer both resident permanently, VAEs cycle
@@ -477,6 +450,29 @@ if H3_TE_PROJ:
 # audio_vae and does not apply here.
 H3_VIDEO_VAE_FP16 = os.environ.get("H3_VIDEO_VAE_FP16", "0").strip() == "1"
 
+# VAE 対 (~11GB fp32) を GPU に常駐させ続けるか。"auto" (既定) / "0" / "1"。
+#
+# `bnb-4bit` モードは既定で VAE を CPU にパークし、必要な位相だけ GPU へ移す
+# (`_vae_to_gpu`/`_vae_to_cpu`)。96GB機ではこれが**必須**で、
+# transformer(66.3) + TE-nf4(21.0) + VAE対(11.0) = 98.5GB がカードの ~95.6GB を超えて
+# 実際に OOM した経緯がある (モジュール冒頭 docstring 参照)。`none` モードは元から常駐。
+#
+# **統合メモリ機ではこの往復が有害になる** (2026-08-12、GB10 で判明):
+#   1. CPU へパークしても VRAM と RAM が同一プールなので **1バイトも空かない**
+#   2. `.to(DEVICE)` は 11GB の実コピーを作り、CPU 側の実体も生きたままなので
+#      デコード位相の実圧が **+11GB** 増える (専用VRAMの箱なら別プール間の移動で
+#      相殺されるところ)。つまり往復は「空けるため」の操作なのに逆に圧を上げている
+#   3. 毎リクエスト 11GB×2 のコピーと `empty_cache()` の時間を払う
+# "auto" はこれを**ハードウェア特性で**判定する (`_is_unified_memory()`) --
+# 変動する空き容量で決めると起動ごとに挙動が変わって再現性が無くなるため。
+# 統合メモリでない箱では "auto" は従来どおり CPU パークのままで、挙動は変わらない。
+H3_VAE_RESIDENT = os.environ.get("H3_VAE_RESIDENT", "auto").strip().lower()
+if H3_VAE_RESIDENT not in ("auto", "0", "1"):
+    raise ValueError(f"H3_VAE_RESIDENT must be 'auto', '0' or '1', got {H3_VAE_RESIDENT!r}")
+
+# VAE 対の実測サイズ (fp32、video + audio)。
+_VAE_PAIR_GB = 11.0
+
 # "fbc" (default; A/B verified 2026-08-04: threshold 0.05 gives -25% denoise time with
 # near-identical output -- PSNR 31.8-34.3dB vs no-cache, audio corr 0.979, no visible drift.
 # threshold 0.1 reaches 1.92x but composition drifts visibly; not recommended as default).
@@ -528,23 +524,6 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
-
-# ref2va リクエストの終わりに、入口で解放した t2va 用 `transformer` を**その場で**
-# 積み直すか (2026-08-12 に既定を「積み直さない」へ変更)。
-#
-# 旧既定 (eager) の問題: 復元は**そのリクエストの所要時間に含まれる**ため、ユーザーは
-# 自分の動画とは無関係なロードを待たされる (実測 12.5s、初回は 36.9s)。しかも次も
-# ref2va なら入口でまた解放されるので**完全な無駄**であり、復元した瞬間に両 transformer
-# が載って VRAM 高水位が 49GB → 74.3GB へ跳ね上がる (48GB 級で運用する場合に致命的)。
-# 元のコメントが根拠にしていた収支は 32B TE (21GB) 前提のもので、投影TE (3.11GB) を
-# 使う現在の既定構成には当てはまらない。
-#
-# 遅延 (既定) にしても壊れない理由: t2va リクエストは入口で `_switch_to_variant("t2va")`
-# → `_ensure_transformer()` を必ず通り、未ロードならそこでロードする (冪等)。つまり
-# コストは**消える**のではなく、**それを必要とするリクエスト側へ移る**。連続 ref2va では
-# まるごと消え、ref2va→t2va と切り替えたときだけ t2va 側が払う。
-# 旧挙動に戻すには H3_EAGER_VARIANT_RESTORE=1。
-H3_EAGER_VARIANT_RESTORE = os.environ.get("H3_EAGER_VARIANT_RESTORE", "0").strip() == "1"
 
 # EXPERIMENTAL, opt-in. "0" (default) = every mode above is untouched -- this flag is
 # read nowhere else unless it is "1" or "group". "1" = 48GB-class low-VRAM mode: TE
@@ -623,13 +602,212 @@ if H3_LOWVRAM_ANY:
             "anything else on a 24-48GB-class card."
         )
 
+# ---- 実測容量ベースの VRAM 予算モデル (docs/RESIDENCY.md §3) ----
+# `gpu_mem_gb`/`ram_gb` はこのファイルの後半 (診断ログ用) にあったものをここへ移した --
+# 下の `H3_KEEP_TRANSFORMER` ガードが **import 時に** 予算を計算するため、定義がガードより
+# 前に無いと NameError になる。中身は移動前と同一。
+def gpu_mem_gb() -> dict:
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
+        "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
+        "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+    }
+
+
+def ram_gb() -> dict:
+    meminfo = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split()
+            meminfo[parts[0].rstrip(":")] = int(parts[1])
+    total = meminfo["MemTotal"] / 1e6
+    avail = meminfo["MemAvailable"] / 1e6
+    swap_total = meminfo.get("SwapTotal", 0) / 1e6
+    swap_free = meminfo.get("SwapFree", 0) / 1e6
+    return {
+        "avail_gb": round(avail, 1),
+        "total_gb": round(total, 1),
+        "swap_used_gb": round(swap_total - swap_free, 2),
+        "swap_total_gb": round(swap_total, 1),
+    }
+
+
+# 実効予算 = カタログ容量 − 単位差(~0.5GB) − CUDAコンテキスト等(~1GB)。
+# docs/RESIDENCY.md §3 (241行目) が定義している式そのままで、新しい定義ではない。
+# 検算: 48GB機 51.5 − 1.5 ≈ 50.0 (ドキュメントの 49.81)、20GB カード 21.47 − 1.5 ≈ 19.97
+# (同 19.7)。単位は `gpu_mem_gb()` と同じ decimal GB (/1e9) -- 以下の 34.03/16.29/49.81 等
+# ドキュメント中の数値は全てこの単位なので、GiB と混ぜないこと。
+_VRAM_BUDGET_OVERHEAD_GB = 1.5
+
+# 位相ごとの構成要素 (全て実測値)。出典は各フラグ自身のコメントと
+# docs/RESIDENCY.md の収支表 (§「ケース / 必要 / 実効予算」)。
+_TRANSFORMER_RESIDENT_GB = {"none": 66.3, "int8": 34.03}
+_DENOISE_ACTIVATION_GB = 6.6
+# キーは H3_VIDEO_VAE_FP16 の真偽。fp32 の 16.29GB が fp16 で 11.4GB に落ちる。
+_DECODE_PEAK_GB = {True: 11.4, False: 16.29}
+
+
+def _te_resident_gb(te_quant=None, te_prune=None, te_proj=None) -> float:
+    """計算用GPU上に常駐する text_encoder の実測サイズ (GB)。
+
+    引数を省略すると現在のモジュール設定を見る。`core/settings.py` の
+    `apply_reload_settings()` は **まだ適用していない** 設定で同じ判定をしたいので、
+    そこからは明示的に渡す。
+
+    TE が別GPU (`H3_TE_DEVICE`) に居るなら計算用GPUの収支には乗らないので 0。
+    投影TE (`H3_TE_PROJ`) は NF4 で 3.11GB、32B TE は bnb-4bit で 21.0GB
+    (`H3_TE_PRUNE=1` なら 17.45GB)、bf16 なら 66.3GB (同 53.1GB) -- いずれも
+    `_load_text_encoder()` の docstring と `H3_TE_PROJ` のコメントにある実測値。
+    """
+    te_quant = TE_QUANT if te_quant is None else te_quant
+    te_prune = H3_TE_PRUNE if te_prune is None else te_prune
+    te_proj = H3_TE_PROJ if te_proj is None else te_proj
+    if H3_TE_DEVICE and H3_TE_DEVICE != str(DEVICE):
+        return 0.0
+    if te_proj:
+        return 3.11
+    if te_quant == "bnb-4bit":
+        return 17.45 if te_prune else 21.0
+    return 53.1 if te_prune else 66.3
+
+
+def _effective_vram_budget_gb(device: torch.device = DEVICE) -> float | None:
+    """このGPUの実効予算 (GB)。測定できなければ `None`。
+
+    `None` を返した場合、呼び出し側は **従来の直書き判定へフォールバックする** こと --
+    「容量不明なら今までどおり拒否」が安全側で、測れないことを許可の根拠にしてはいけない。
+
+    **統合メモリ機の補正**: GB10 (DGX Spark) のような `is_integrated` なデバイスでは
+    `total_memory` が **システムメモリ全体** を指すため、そのまま専用VRAMとして扱うと
+    ホスト側の常駐分と二重計上になる (VAE 対 ~11GB は CPU にパークされ、プロセス自体と
+    ページキャッシュも同じプールに居る)。そこで `MemAvailable` 側でも上限を掛ける。
+    swap ゼロの箱では OOM killer に猶予が無く、ここを楽観視すると強制終了に戻る。
+    """
+    try:
+        props = torch.cuda.get_device_properties(device.index or 0)
+    except Exception:
+        return None
+    budget = props.total_memory / 1e9 - _VRAM_BUDGET_OVERHEAD_GB
+    if getattr(props, "is_integrated", 0):
+        try:
+            avail_gb = ram_gb()["avail_gb"]
+        except Exception:
+            return None
+        budget = min(budget, avail_gb - _VRAM_BUDGET_OVERHEAD_GB)
+    return budget
+
+
+# 32B TE の bf16 チェックポイントの実サイズ。`text_encoder/model.safetensors.index.json`
+# の `metadata.total_size` = 66,714,780,128 バイト。**この値は Qwen/Qwen3-VL-32B-Instruct
+# の同ファイルとバイト単位で一致する** (2026-08-12 確認。config.json も
+# `transformers_version` の値まで一致) -- H3 の text_encoder は素の
+# Qwen3-VL-32B-Instruct そのものだと分かる。
+_TE_CHECKPOINT_BF16_GB = 66.71
+
+
+@functools.lru_cache(maxsize=1)
+def _is_unified_memory() -> bool:
+    """このGPUが統合メモリ (GB10 / DGX Spark など) か。
+
+    CUDA の初期化を伴うので **呼ぶのは実際に判定が要る場所だけ**にすること
+    (import 時の既定経路からは呼ばない)。測定できなければ False -- 「分からないなら
+    従来どおり」で、統合メモリ向けの追加ガードは掛けない。
+    """
+    try:
+        return bool(getattr(torch.cuda.get_device_properties(DEVICE.index or 0), "is_integrated", 0))
+    except Exception:
+        return False
+
+
+def _vae_parks_on_cpu() -> bool:
+    """VAE 対を CPU にパークする構成か (`H3_VAE_RESIDENT` のコメント参照)。
+
+    `_ensure_vaes` / `_vae_to_gpu` / `_vae_to_cpu` の3箇所が VAE の置き場所を決める唯一の
+    場所なので、判定はここ1本に集約してある。False なら VAE は最初から最後まで GPU に
+    居続け、`_vae_to_gpu`/`_vae_to_cpu` は no-op になる (`none` モードと同じ扱い)。
+    """
+    if TE_QUANT != "bnb-4bit":
+        return False  # `none` モードは元から GPU 常駐
+    if H3_VAE_RESIDENT == "1":
+        return False
+    if H3_VAE_RESIDENT == "0":
+        return True
+    return not _is_unified_memory()  # "auto"
+
+
+def _preflight_room(label: str, need_gb: float) -> None:
+    """大物モデルのロード直前に、統合メモリ機で空きが足りるか確かめる。
+
+    **統合メモリ機だけを対象にする**。専用VRAMの箱で足りなければ torch が普通に
+    CUDA OOM を投げてくれてプロセスは生き残るが、統合メモリ機で足りないと
+    **カーネルの OOM killer がプロセスごと殺す** -- 2026-08-12 に実際に起きた
+    (`Loading weights: 378/1058` で強制終了、ログも例外も残らない)。予測できるなら
+    殺される前に自分で落ちた方が、原因が分かるぶんましである。
+
+    発想は `H3_GROUP_OFFLOAD_MIN_RAM_GB` (group モードが CPU 常駐ロードの前に
+    ホストRAMを確かめるガード) と同じで、対象を統合メモリ機の全ロードへ広げたもの。
+    """
+    if not _is_unified_memory():
+        return
+    try:
+        avail_gb = ram_gb()["avail_gb"]
+    except Exception:
+        return
+    logger.info(
+        "preflight %s: need ~%.2fGB (+%.1fGB margin), avail %.2fGB",
+        label, need_gb, _VRAM_BUDGET_OVERHEAD_GB, avail_gb,
+    )
+    if need_gb + _VRAM_BUDGET_OVERHEAD_GB > avail_gb:
+        raise RuntimeError(
+            f"{label} のロードを中止しました: 約 {need_gb:.2f}GB 必要ですが、空きは "
+            f"{avail_gb:.2f}GB しかありません。この箱は統合メモリ (VRAM と RAM が同一プール) "
+            "なので、このまま進めると OOM killer にプロセスごと殺されます。"
+            "他のプロセスを終了させるか、H3_TE_PROJ (32B TE -> 3.11GB の投影TE)、"
+            "H3_TRANSFORMER_QUANT=int8 (66.3GB -> 34.03GB) などで所要量を下げてください。"
+        )
+
+
+def _residency_requirements_gb(
+    transformer_quant=None, video_vae_fp16=None, te_quant=None, te_prune=None, te_proj=None,
+    vae_resident=None,
+) -> dict[str, float]:
+    """各位相が計算用GPUに要求する量 (GB)。引数省略時は現在のモジュール設定。
+
+    位相の切り方は docs/RESIDENCY.md §3 の3本の不等式 (エンコード / デノイズ / デコード)
+    そのまま。transformer が常駐し続ける構成 (`H3_KEEP_TRANSFORMER=1`) を前提に、
+    どの位相でも transformer 分が乗る形で積む。
+    """
+    transformer_quant = H3_TRANSFORMER_QUANT if transformer_quant is None else transformer_quant
+    video_vae_fp16 = H3_VIDEO_VAE_FP16 if video_vae_fp16 is None else video_vae_fp16
+    transformer = _TRANSFORMER_RESIDENT_GB[transformer_quant]
+    te = _te_resident_gb(te_quant=te_quant, te_prune=te_prune, te_proj=te_proj)
+    # VAE 常駐構成では encode/denoise 位相にも VAE 対 11GB が乗る (CPU パーク構成では
+    # その位相に居ないので 0)。decode 位相は元から VAE がGPUに居る前提の実測ピーク
+    # (16.29 / fp16 なら 11.4、weights + 活性化込み) なので二重に足さないこと。
+    #
+    # `vae_resident` を明示できるようにしてあるのは、**別の箱の収支を再現する**ため
+    # (`scripts/probe_residency_budget.py` が 48GB機の表を引き直す)。既定は
+    # `_vae_parks_on_cpu()` = 走っている箱の実際の構成。
+    if vae_resident is None:
+        vae_resident = not _vae_parks_on_cpu()
+    vae = _VAE_PAIR_GB if vae_resident else 0.0
+    return {
+        "encode": transformer + te + vae,
+        "denoise": transformer + te + vae + _DENOISE_ACTIVATION_GB,
+        "decode": transformer + te + _DECODE_PEAK_GB[bool(video_vae_fp16)],
+    }
+
+
 # EXPERIMENTAL, opt-in. `H3_LOWVRAM=1` は毎リクエスト、デコード直前に transformer を
 # 解放し次リクエストで再ロードする (実測 14.8-32.7s の固定費、RESIDENCY.md §5.5)。
 # `H3_KEEP_TRANSFORMER=1` はその解放をスキップし、transformer をリクエスト間も
 # GPU に常駐させたままにする -- 48GB級 (実効予算 ~49.8GB) では
 # transformer(int8) 34.3GB + デコードピーク **fp16** 11.4GB = 45.7GB で入る見込み
-# (未検証、余裕 ~4GB)。fp32 デコードピーク 16.29GB では 34.3+16.29=50.6GB で
-# 入らないため、H3_VIDEO_VAE_FP16=1 が必須 (RESIDENCY.md §5.6)。
+# (未検証、余裕 ~4GB)。同じ 48GB級で fp32 デコードピーク 16.29GB なら
+# 34.3+16.29=50.6GB で入らない (RESIDENCY.md §5.6)。**この「fp16 が必須」は 48GB級
+# 固有の結論であって、フラグの前提条件ではない** -- 下の予算判定が箱ごとに決める。
 #
 # **plain モード (H3_LOWVRAM=0) にも適用 (2026-08-12 に条件1を緩和)**: plain モードは
 # transformer をリクエスト間は常駐させているが、**デコード窓だけは解放して直後に
@@ -637,26 +815,33 @@ if H3_LOWVRAM_ANY:
 # transformer bf16 66.3GB + VAE fp32 11GB = 98.5GB > 96GB」という 32B TE 前提の収支から
 # 来たもので、**TE が GPU0 に居ない構成 (条件2) では前提が成立しない**:
 # 66.3 + fp16 デコード 11.4 = 77.7GB (投影TE を同居させても +3.11 で 80.8GB)。
-# つまり条件2・3 がそのまま plain モードの成立条件でもあるので、条件1を
-# 「group でないこと」に緩めるだけでよい (解放をスキップする分岐は共通、復元側の
-# `_ensure_transformer` は冪等なので no-op になる)。bf16 のデノイズは int8 より
-# 5-14% 速い (t2i 2.07s vs 2.40s) ため、96GB 級ではこちらが最速になりうる。
-# **注意**: 66.3+11.4=77.7GB なので実質 80GB 級以上が必要 (48GB 級では bf16
-# transformer 自体が載らないので自動的に対象外)。溢れた場合もデコードの try/except が
-# steady state を復元してから re-raise する。
+# plain モードでも成立条件は同じ収支の話に帰着するので、条件1を「group でないこと」に
+# 緩めるだけでよい (解放をスキップする分岐は共通、復元側の `_ensure_transformer` は
+# 冪等なので no-op になる)。bf16 のデノイズは int8 より 5-14% 速い
+# (t2i 2.07s vs 2.40s) ため、96GB 級ではこちらが最速になりうる。
+# **注意**: 66.3+11.4=77.7GB (fp32 デコードなら 82.6GB) なので実質 80GB 級以上が必要
+# (48GB 級では bf16 transformer 自体が載らないので自動的に対象外)。溢れた場合も
+# デコードの try/except が steady state を復元してから re-raise する。
 #
-# 成立条件 (3つとも必須、欠けたら import 時に RuntimeError):
+# 成立条件 (欠けたら import 時に RuntimeError):
 #   1) H3_LOWVRAM が "group" でないこと ("1" = 毎リクエストの再ロード固定費を削減、
 #      "0"/plain = デコード窓の解放/再ロードを削減。"group" だけは対象外 --
 #      そもそも transformer を常駐させたまま CPU/GPU 間を group offload する
-#      別設計なので無関係)
-#   2) H3_TE_DEVICE が設定済み (TE が別GPU)。そうでないと **デコード位相ではなく
-#      エンコード位相が先に破綻する**: TE(bnb-4bit) 17.45GB + transformer(int8)
-#      34.3GB = 51.75GB > 実効予算49.8GB で、prompt encode の時点で入らない
-#      (transformer を常駐させたまま TE を同じGPUにロードしようとするため)
-#   3) H3_VIDEO_VAE_FP16 == True (上記のとおり fp32 では 50.6GB で入らない)
+#      別設計なので無関係)。これは容量の話ではない直交性のガードなので、下の
+#      予算判定とは無関係に常に効く。
+#   2) 全位相 (エンコード / デノイズ / デコード) の所要量が **実測した実効予算**に
+#      収まること。**2026-08-12 に直書き定数から実測比較へ変更した**: 以前は
+#      「H3_TE_DEVICE が設定済み」「H3_VIDEO_VAE_FP16=1」の2条件を必須にしていたが、
+#      その根拠 (51.75GB / 50.6GB > 実効予算 49.8GB) は **48GB カード固有の収支**で
+#      あって、箱が変われば前提ごと変わる。実際 GB10 (統合メモリ 128.45GB) では
+#      bf16 transformer 66.3 + 投影TE 3.11 + fp32 デコードピーク 16.29 = 85.7GB が
+#      収まるので、fp16 デコードを強制する理由が無い。判定は
+#      `_residency_requirements_gb()` と `_effective_vram_budget_gb()` が行う。
+#      **容量を測れなかったときは旧来の2条件へフォールバックする** -- 測れないことを
+#      許可の根拠にはしない。
 # 既定 (H3_KEEP_TRANSFORMER=0) は 1バイトも挙動が変わらない -- 既存の
-# H3_LOWVRAM=1 の「リクエスト間は何も常駐させない」定常状態のまま。
+# H3_LOWVRAM=1 の「リクエスト間は何も常駐させない」定常状態のまま。CUDA の初期化を
+# import 時に起こさないよう、予算計算はこのフラグが立っているときだけ実行する。
 H3_KEEP_TRANSFORMER = os.environ.get("H3_KEEP_TRANSFORMER", "0").strip() == "1"
 if H3_KEEP_TRANSFORMER:
     _keep_transformer_missing = []
@@ -666,34 +851,55 @@ if H3_KEEP_TRANSFORMER:
             "already keeps its transformer resident via a different (CPU+block-offload) "
             "design and is unrelated"
         )
-    if not H3_TE_DEVICE and not H3_TE_PROJ:
-        # この条件は **32B TE を前提にした収支** から来ている: TE-nf4 17.45GB +
-        # 常駐 transformer-int8 34.3GB = 51.75GB で、実効予算 ~49.8GB を超えるため
-        # デコードより先に**エンコード位相**が破綻する。だから「TE は別GPUへ」が必須だった。
-        #
-        # **投影TE (H3_TE_PROJ) はこの前提を満たさない**: NF4 で常駐 3.11GB (実測) なので
-        # 3.11 + 34.03 = 37.1GB、デノイズ活性化 6.6GB を足しても 43.7GB で予算内に収まる。
-        # つまり同一GPU上で TE と transformer を同時常駐させられる — H3_TE_DEVICE を
-        # 要求する理由がない。投影TEのときはこのガードを免除する。
+    _keep_transformer_budget_gb = _effective_vram_budget_gb()
+    _keep_transformer_needs = _residency_requirements_gb()
+    _keep_transformer_phase, _keep_transformer_peak_gb = max(
+        _keep_transformer_needs.items(), key=lambda kv: kv[1]
+    )
+    if _keep_transformer_budget_gb is None:
+        # 容量を測れない (CUDA 不在など) -- 旧来の直書き判定 (48GB級の収支) をそのまま使う。
+        if not H3_TE_DEVICE and not H3_TE_PROJ:
+            _keep_transformer_missing.append(
+                "H3_TE_DEVICE must be set (TE on a separate GPU) -- otherwise the *encode* "
+                "phase (not decode) breaks first: TE-nf4 17.45GB + resident transformer-int8 "
+                "34.3GB = 51.75GB, over the ~49.8GB effective budget. "
+                "(Not required when H3_TE_PROJ is set: the projected TE is 3.11GB at NF4, so "
+                "it fits on the same GPU alongside the transformer.) "
+                "[GPU capacity could not be measured, so this fell back to the hardcoded "
+                "48GB-class budget]"
+            )
+        if not H3_VIDEO_VAE_FP16:
+            _keep_transformer_missing.append(
+                "H3_VIDEO_VAE_FP16 must be '1' -- fp32 decode peak 16.29GB + resident "
+                "transformer-int8 34.3GB = 50.6GB, over the ~49.8GB effective budget "
+                "(fp16 decode peak ~11.4GB fits: 34.3+11.4=45.7GB) "
+                "[GPU capacity could not be measured, so this fell back to the hardcoded "
+                "48GB-class budget]"
+            )
+    elif _keep_transformer_peak_gb > _keep_transformer_budget_gb:
         _keep_transformer_missing.append(
-            "H3_TE_DEVICE must be set (TE on a separate GPU) -- otherwise the *encode* "
-            "phase (not decode) breaks first: TE-nf4 17.45GB + resident transformer-int8 "
-            "34.3GB = 51.75GB, over the ~49.8GB effective budget. "
-            "(Not required when H3_TE_PROJ is set: the projected TE is 3.11GB at NF4, so "
-            "it fits on the same GPU alongside the transformer.)"
-        )
-    if not H3_VIDEO_VAE_FP16:
-        _keep_transformer_missing.append(
-            "H3_VIDEO_VAE_FP16 must be '1' -- fp32 decode peak 16.29GB + resident "
-            "transformer-int8 34.3GB = 50.6GB, over the ~49.8GB effective budget "
-            "(fp16 decode peak ~11.4GB fits: 34.3+11.4=45.7GB)"
+            f"the {_keep_transformer_phase} phase needs {_keep_transformer_peak_gb:.2f}GB "
+            f"(transformer={_TRANSFORMER_RESIDENT_GB[H3_TRANSFORMER_QUANT]:.2f} + "
+            f"text_encoder={_te_resident_gb():.2f} + phase peak), over this GPU's measured "
+            f"effective budget of {_keep_transformer_budget_gb:.2f}GB. Free budget by "
+            "setting H3_VIDEO_VAE_FP16=1 (fp32 decode peak 16.29GB -> fp16 11.4GB), "
+            "H3_TE_PROJ (32B TE -> 3.11GB projected TE), H3_TE_DEVICE (TE onto a separate "
+            "GPU) or H3_TRANSFORMER_QUANT=int8 (66.3GB -> 34.03GB)"
         )
     if _keep_transformer_missing:
         raise RuntimeError(
-            "H3_KEEP_TRANSFORMER=1 requires H3_LOWVRAM != 'group' AND (H3_TE_DEVICE set "
-            "OR H3_TE_PROJ set) AND H3_VIDEO_VAE_FP16=1 (see this flag's module comment "
-            "for the VRAM budget derivation). Missing: " + "; ".join(_keep_transformer_missing)
+            "H3_KEEP_TRANSFORMER=1 requires H3_LOWVRAM != 'group' AND that every phase "
+            "fit this GPU's measured effective budget (see this flag's module comment "
+            "and docs/RESIDENCY.md §3 for the budget model). Unmet: "
+            + "; ".join(_keep_transformer_missing)
         )
+    logger.info(
+        "H3_KEEP_TRANSFORMER=1 fits: needs %s, worst phase %s %.2fGB, effective budget %s",
+        {k: round(v, 2) for k, v in _keep_transformer_needs.items()},
+        _keep_transformer_phase, _keep_transformer_peak_gb,
+        f"{_keep_transformer_budget_gb:.2f}GB" if _keep_transformer_budget_gb is not None
+        else "unmeasurable (fell back to the hardcoded 48GB-class rules)",
+    )
 
 # "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
 # the int8 transformer (~34GB) is loaded once and stays resident in host RAM for the
@@ -868,16 +1074,8 @@ H3_TURBO_LORA = os.environ.get("H3_TURBO_LORA", "0").strip() == "1"
 # (README「Turbo LoRA 完成版のリリース待ち → lightx2v 版」節のスパイク実測参照)。
 # 旧 Ostris 版に戻すには REPO/FILE を larryvrh/MiniMax-H3-Turbo-Lora /
 # minimax_h3_turbo_4step.safetensors にする (bf16 経路専用のまま)。
-# 既定ファイルは 2026-08-12 に v0.1 -> 4step v1.0 768p へ切替 (README「2026-08-12」節の
-# スパイクで確認済み: 768p 版のほうが同じ4stepsで品質が上、scale/shift は下の
-# resolve_turbo_lora_scale()/H3_TURBO_VIDEO_SHIFT が metadata/ファイル名から自動導出する
-# ので追加の env 指定は不要)。旧 v0.1 に戻すには
-# H3_TURBO_LORA_FILE=minimax_h3_fl2v_turbo_4step_v0.1.safetensors を明示すればよい
-# (scale はその場で metadata フォールバック=0.094、shift は自動切替なしに戻る)。
 H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "lightx2v/Minimax-h3-Turbo")
-H3_TURBO_LORA_FILE = os.environ.get(
-    "H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
-)
+H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v0.1.safetensors")
 
 # 既知の comfy (融合QKV) 形式リポジトリ。int8 との組み合わせ拒否 (import 時と
 # リクエスト時の両方) はこの形式のときだけ必要 -- diffusers ネイティブ形式は
@@ -914,35 +1112,6 @@ if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
         "cpu_param_dict は有効化時点で固定されるため、後から追加される LoRA バッファが "
         "offload サイクルから欠落するリスクがある -- 未検証)。H3_LOWVRAM=1 を使ってください。"
     )
-
-# スケジューラの exponential shift の上書き (既定は空 = 触らない)。H3 の既定は
-# video 12.0 / audio 3.0 (scheduler_config.json) で、turbo v0.1・8step v1.0 も同じ格子で
-# 蒸留されているため通常は不要。**turbo 4step v1.0 768p だけは video shift 6 で蒸留**
-# されており (上流 ModelTC/Minimax-H3-Turbo の Model specs 表: Training shifts 6 / 3)、
-# その LoRA を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
-# 蒸留時とずれる。適用箇所は `_ensure_vaes` のスケジューラロード直後 (プロセスに1回。
-# scheduler は _pipe/_pipe_ref で同一オブジェクトを共有するため1箇所で足りる)。
-H3_VIDEO_SHIFT = os.environ.get("H3_VIDEO_SHIFT", "").strip()
-H3_AUDIO_SHIFT = os.environ.get("H3_AUDIO_SHIFT", "").strip()
-
-# turbo LoRA が有効なリクエストにだけ適用する video shift の上書き (既定は空 =
-# ファイル名から自動判定)。H3_VIDEO_SHIFT (上) はプロセス全体・全リクエスト共通の
-# 上書きなのに対し、こちらは「turbo=1 のリクエストのときだけ shift を切り替え、
-# turbo=0 のリクエストでは配布既定 (またはH3_VIDEO_SHIFTがあればそれ) に戻す」
-# リクエスト単位の切替 -- turbo は `cache`/`attn` と同じ instant-apply (リクエスト
-# ごとに on/off できる) なので、shift もそれに追従する必要がある (固定してしまうと
-# turbo=0 のリクエストが誤った格子で走る)。
-# 解決規則: 明示指定があればその値を最優先。空なら
-# H3_TURBO_LORA_FILE のファイル名に `_768p` を含むかどうかで自動判定する
-# (768p 系だけ video shift 6 で蒸留されている -- 上の H3_VIDEO_SHIFT のコメント参照)。
-# 該当しなければ「切替なし」(turbo=1 でも配布既定/H3_VIDEO_SHIFT のまま)。
-H3_TURBO_VIDEO_SHIFT_RAW = os.environ.get("H3_TURBO_VIDEO_SHIFT", "").strip()
-if H3_TURBO_VIDEO_SHIFT_RAW:
-    H3_TURBO_VIDEO_SHIFT: float | None = float(H3_TURBO_VIDEO_SHIFT_RAW)
-elif "_768p" in H3_TURBO_LORA_FILE:
-    H3_TURBO_VIDEO_SHIFT = 6.0
-else:
-    H3_TURBO_VIDEO_SHIFT = None
 if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
         "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
@@ -1075,21 +1244,11 @@ def _reject_unsupported_proj_tokens(token_ids: list[int]) -> None:
     (H3 トークナイザ、通常語彙は 4B とID完全一致) の直後にこれを呼ぶ。"""
     bad = sorted({t for t in token_ids if t >= H3_TE_PROJ_UNSUPPORTED_TOKEN_ID_START})
     if bad:
-        # 文面は**そのまま UI のエラー表示に出る**ので、原因だけでなく「次に何をすれば
-        # よいか」まで書く (2026-08-12 に改稿)。自動でのTE切替はしない方針 -- 32B TE は
-        # 常駐 21GB (投影TE は 3.11GB) で速度も落ちるため、切り替えるかどうかは
-        # オペレーターの判断に委ねる。UI の再ロード設定パネルなら再起動なしで切替可能。
         raise ValueError(
-            "台詞タグ <d>…</d> は現在の設定では使えません。"
-            "いま有効な投影TE (Qwen3-VL-4B) の語彙に H3 固有の台詞タグが無いためです"
-            f"(該当トークンID: {bad})。\n"
-            "台詞を喋らせるには、次のいずれかにしてください:\n"
-            "(1) 【推奨】UI 右側の「再ロードが必要な設定」パネルで **投影TE を OFF** にして"
-            "適用する → 32B TE に切り替わり <d> が使えます"
-            "(再起動不要。ただし TE 常駐が 3.11GB → 21GB に増え、生成も遅くなります)。\n"
-            "(2) 台詞を音声参照 (fully_copy) で入れる → 投影TE のままで使えます。\n"
-            "(3) <d> タグを外し、地の文で「〜と挨拶する」のように書く → 発話らしい音は出ますが、"
-            "台詞の内容は保証されません。"
+            f"投影TE (H3_TE_PROJ) は H3 固有の特殊トークン (台詞タグ <d>/</d> 等、"
+            f"id>={H3_TE_PROJ_UNSUPPORTED_TOKEN_ID_START}) を扱えません "
+            f"(このプロンプトに含まれる該当トークンID: {bad})。"
+            "台詞は音声参照 (fully_copy) で入れるか、H3_TE_PROJ を無効にすること。"
         )
 
 
@@ -1962,53 +2121,13 @@ def turbo_lora_expected_format() -> str:
     return "comfy" if H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS else "diffusers"
 
 
-def resolve_turbo_lora_scale(lora_format: str, lora_path: str | None = None) -> float:
-    """適用係数を解決する。優先順位:
-
-    1. `H3_TURBO_LORA_SCALE` が明示されていればそれを最優先。
-    2. 未指定なら、`lora_path` のチェックポイント自身の safetensors metadata に
-       `alpha` があれば `scale = float(alpha) / rank` を使う (rank はソート済み
-       最初の `lora_A` キーの shape[0] -- lightx2v/Minimax-h3-Turbo の3ファイルは
-       いずれも128)。2026-08-12 に追加された v1.0 系 (8step/768p) はどちらも
-       metadata に `alpha` を持つ (8step: alpha='8' -> scale=0.0625, 768p:
-       alpha='128' -> scale=1.0 -- 実測でスパイク済み、README「2026-08-12」節参照)
-       ので、ここで自動導出できる。
-    3. metadata に `alpha` が無ければ (例: 旧 v0.1 ファイル) 形式ごとの実測既定へ
-       フォールバック: comfy=1.0 / diffusers=0.094 (導出と強度スイープの実測は
-       H3_TURBO_LORA_SCALE のモジュールコメントと README を参照)。
-
-    解決した scale とその出典を1行 logger.info する。
-    """
+def resolve_turbo_lora_scale(lora_format: str) -> float:
+    """適用係数を解決する: H3_TURBO_LORA_SCALE が明示されていればそれ、空なら
+    形式ごとの実測既定 (comfy=1.0 / diffusers=0.094 -- 導出と強度スイープの実測は
+    H3_TURBO_LORA_SCALE のモジュールコメントと README を参照)。"""
     if H3_TURBO_LORA_SCALE_RAW:
-        scale = float(H3_TURBO_LORA_SCALE_RAW)
-        logger.info("turbo LoRA scale resolved: %.4f (source=env H3_TURBO_LORA_SCALE)", scale)
-        return scale
-
-    if lora_path is not None:
-        try:
-            from safetensors import safe_open
-
-            with safe_open(lora_path, framework="pt") as f:
-                metadata = f.metadata() or {}
-                alpha_raw = metadata.get("alpha")
-                if alpha_raw is not None:
-                    lora_a_keys = sorted(k for k in f.keys() if ".lora_A." in k)
-                    rank = f.get_slice(lora_a_keys[0]).get_shape()[0]
-                    scale = float(alpha_raw) / rank
-                    logger.info(
-                        "turbo LoRA scale resolved: %.4f (source=metadata alpha=%s, rank=%d, file=%s)",
-                        scale, alpha_raw, rank, lora_path,
-                    )
-                    return scale
-        except Exception:
-            logger.warning(
-                "turbo LoRA metadata alpha probe failed for %s, falling back to format default",
-                lora_path, exc_info=True,
-            )
-
-    scale = 1.0 if lora_format == "comfy" else 0.094
-    logger.info("turbo LoRA scale resolved: %.4f (source=format-default, format=%s)", scale, lora_format)
-    return scale
+        return float(H3_TURBO_LORA_SCALE_RAW)
+    return 1.0 if lora_format == "comfy" else 0.094
 
 
 def apply_diffusers_turbo_lora(transformer, lora_path: str, scale: float) -> int:
@@ -2237,34 +2356,6 @@ def _num_frames_from_audio_reference(references: list, fps: int) -> int:
         )
     num_samples = waveform.shape[-1]
     return align_num_frames(round(num_samples / sample_rate * fps))
-
-
-def gpu_mem_gb() -> dict:
-    if not torch.cuda.is_available():
-        return {}
-    return {
-        "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
-        "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
-        "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
-    }
-
-
-def ram_gb() -> dict:
-    meminfo = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            parts = line.split()
-            meminfo[parts[0].rstrip(":")] = int(parts[1])
-    total = meminfo["MemTotal"] / 1e6
-    avail = meminfo["MemAvailable"] / 1e6
-    swap_total = meminfo.get("SwapTotal", 0) / 1e6
-    swap_free = meminfo.get("SwapFree", 0) / 1e6
-    return {
-        "avail_gb": round(avail, 1),
-        "total_gb": round(total, 1),
-        "swap_used_gb": round(swap_total - swap_free, 2),
-        "swap_total_gb": round(swap_total, 1),
-    }
 
 
 def _log_gpu_tensor_diag(label: str, top_n: int = 20):
@@ -2513,7 +2604,7 @@ class MiniMaxH3Runner:
                     return _orig_vae_encode(sample, *args, **kwargs)
 
             self._pipe.vae.encode = _fp16_autocast_encode
-        if TE_QUANT == "bnb-4bit":
+        if _vae_parks_on_cpu():
             # Parked on CPU by default in this mode -- moved to GPU only for the phase
             # that needs them (keyframe encode / decode). See module docstring.
             self._pipe.vae.to(CPU)
@@ -2524,19 +2615,6 @@ class MiniMaxH3Runner:
             self._pipe.audio_vae.to(DEVICE)
             self._vae_on_gpu = True
         self._pipe.load_components(names=["scheduler", "audio_scheduler"])
-        # H3_VIDEO_SHIFT / H3_AUDIO_SHIFT (既定は空 = 配布 config の 12.0 / 3.0 のまま)。
-        # 用途と根拠はモジュール定数のコメント参照 (turbo 4step v1.0 768p が video shift 6)。
-        if H3_VIDEO_SHIFT:
-            self._pipe.scheduler.set_shift(float(H3_VIDEO_SHIFT))
-            logger.info("video scheduler shift overridden: %s (H3_VIDEO_SHIFT)", H3_VIDEO_SHIFT)
-        if H3_AUDIO_SHIFT:
-            self._pipe.audio_scheduler.set_shift(float(H3_AUDIO_SHIFT))
-            logger.info("audio scheduler shift overridden: %s (H3_AUDIO_SHIFT)", H3_AUDIO_SHIFT)
-        # turbo=1 のリクエストだけ video shift を切り替える `_apply_turbo_video_shift()`
-        # の「元に戻す」先。H3_VIDEO_SHIFT の上書きが上で既に適用された*後*に読むことが
-        # 重要 -- プロセス全体の base はこの値 (H3_VIDEO_SHIFT 指定時はそれ、未指定なら
-        # 配布 config の 12.0) であって、常に 12.0 ではない。
-        self._base_video_shift = self._pipe.scheduler.shift
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
@@ -2570,8 +2648,12 @@ class MiniMaxH3Runner:
     def _vae_to_gpu(self):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
+
+        VAE 常駐構成 (`_vae_parks_on_cpu()` が False、統合メモリ機の既定) では
+        `_ensure_vaes` が最初から GPU に置くので `self._vae_on_gpu` が True のまま =
+        この呼び出しは no-op になる。呼び出し側は分岐を持たなくてよい。
         """
-        if TE_QUANT != "bnb-4bit" or self._vae_on_gpu:
+        if not _vae_parks_on_cpu() or self._vae_on_gpu:
             return
         t0 = time.time()
         self._pipe.vae.to(DEVICE)
@@ -2582,8 +2664,13 @@ class MiniMaxH3Runner:
     def _vae_to_cpu(self):
         """bnb-4bit mode only: move the VAEs back off GPU once their phase is done, to make
         room for the permanently-resident transformer + TE-nf4 during denoise.
+
+        VAE 常駐構成 (`_vae_parks_on_cpu()` が False) では no-op。統合メモリ機では
+        「CPU へ退避して VRAM を空ける」が成立しない (同一プール) ばかりか、CPU 側の
+        実体が生きたまま GPU 側のコピーを作るぶん実圧が増えるため -- `H3_VAE_RESIDENT`
+        のコメント参照。
         """
-        if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
+        if not _vae_parks_on_cpu() or not self._vae_on_gpu:
             return
         t0 = time.time()
         self._pipe.vae.to(CPU)
@@ -2634,6 +2721,10 @@ class MiniMaxH3Runner:
         if TE_QUANT != "bnb-4bit":
             # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM.
             self._free_text_encoder()
+        # 統合メモリ機のみ、ロード前に空きを確かめる (足りなければ OOM killer より先に
+        # 例外で落ちる)。**解放の後**に置くこと -- 上の `_free_text_encoder()` が空けた分を
+        # 数えないと、`none` モードの正常な載せ替えを誤って拒否してしまう。
+        _preflight_room("transformer", _TRANSFORMER_RESIDENT_GB[H3_TRANSFORMER_QUANT])
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
         t0 = time.time()
@@ -2717,8 +2808,7 @@ class MiniMaxH3Runner:
                 )
             return apply_turbo_lora(transformer, self._turbo_lora_path)
         return apply_diffusers_turbo_lora(
-            transformer, self._turbo_lora_path,
-            resolve_turbo_lora_scale(lora_format, self._turbo_lora_path),
+            transformer, self._turbo_lora_path, resolve_turbo_lora_scale(lora_format)
         )
 
     def _download_turbo_lora_if_needed(self):
@@ -3247,50 +3337,6 @@ class MiniMaxH3Runner:
         # else: turbo requested False and it was never wrapped in the first place --
         # nothing to do, the transformer's Linears are still the plain unwrapped ones.
 
-    def _apply_turbo_video_shift(self, turbo_effective: bool) -> None:
-        """Switch the (process-wide, shared) video scheduler's shift for this request,
-        based on the request's *resolved* turbo state (`instant["turbo"]`) -- turbo is a
-        per-request instant-apply setting (like `cache`/`attn`), so the shift a
-        turbo-distilled checkpoint needs has to follow it per-request too, not get
-        fixed at process start the way `H3_VIDEO_SHIFT` alone would.
-
-        No-op entirely when `H3_TURBO_VIDEO_SHIFT` (module-level, resolved from either
-        the env var or the configured turbo LoRA file's name -- see its own module
-        comment) is `None`: this happens for every non-`_768p` turbo LoRA file (v0.1,
-        8step v1.0), which were both distilled at the same shift the base model already
-        defaults to, so there is nothing to switch between turbo=1 and turbo=0 for.
-        Also effectively unreachable when `H3_TURBO_LORA=0` (LoRA disabled for this
-        process): callers only invoke this after `settings.resolve_instant_settings()`,
-        and `turbo_effective` can only be True if `H3_TURBO_LORA=1` unless a request
-        explicitly opts in via `turbo=True` -- but the request-level override is itself
-        rejected before reaching a transformer that never got the turbo LoRA structurally
-        wrapped (`_apply_turbo_setting` above only wraps lazily on `turbo=True`, and
-        every call site of this helper runs on the same request whose turbo flag it
-        checks). Must run before the request's `MiniMaxH3SetTimestepsStep` call(s) --
-        the scheduler bakes `shift` into the sigma schedule at `set_timesteps()` time.
-
-        `self._pipe.scheduler` and `self._pipe_ref.scheduler` are the same object
-        (single ModularPipeline shell, see `_ensure_pipe_ref_shell`'s docstring), so one
-        `set_shift()` call here covers both `generate()`/`generate_still_batch()` (t2va)
-        and `generate_ref2va()`/`generate_ref_batch()` (ref2va) call sites. Audio is
-        deliberately left untouched -- no turbo LoRA variant distilled at a different
-        audio shift has been observed (see `H3_VIDEO_SHIFT`'s module comment: video
-        12.0/audio 3.0 is the shared baseline, and the 768p checkpoint's own upstream
-        spec table only lists a different *video* training shift).
-        """
-        if H3_TURBO_VIDEO_SHIFT is None:
-            return
-        desired = H3_TURBO_VIDEO_SHIFT if turbo_effective else self._base_video_shift
-        scheduler = self._pipe.scheduler
-        if scheduler.shift == desired:
-            return
-        scheduler.set_shift(desired)
-        logger.info(
-            "turbo video scheduler shift %s: %.3f (turbo=%s, H3_TURBO_VIDEO_SHIFT=%.3f, base=%.3f)",
-            "applied" if turbo_effective else "restored", desired, turbo_effective,
-            H3_TURBO_VIDEO_SHIFT, self._base_video_shift,
-        )
-
     def apply_instant_settings(
         self,
         transformer,
@@ -3704,6 +3750,8 @@ class MiniMaxH3Runner:
                 message=f"text_encoder ({H3_TE_PROJ_MODEL}, 投影TE) をロード中...",
             )
         t0 = time.time()
+        # 4B は bf16 で 8.88GB (量子化後は NF4 で 3.11GB)。量子化前の実体で見積もる。
+        _preflight_room(f"text_encoder ({H3_TE_PROJ_MODEL}, 投影TE)", 8.88)
         from transformers import AutoModelForImageTextToText
 
         load_kwargs = dict(
@@ -3793,6 +3841,21 @@ class MiniMaxH3Runner:
         cache_dir = self._te_prequant_dir()
         if H3_TE_PREQUANT and TE_QUANT == "bnb-4bit" and self._load_te_from_prequant(cache_dir, progress):
             return
+        # ここへ来たということは **量子化済みキャッシュを使わない、シャードからの
+        # フルロード**である (`none` モード、または bnb-4bit の初回)。統合メモリ機では
+        # ここが 2026-08-12 に OOM kill された場所なので、始める前に空きを確かめる。
+        #
+        # 見積りに最終常駐サイズ (bnb-4bit なら 21.0GB) ではなく **bf16 チェックポイントの
+        # 実体 66.71GB** を使うのは保守側に倒すため: 実際の kill は 1058 重み中 378
+        # (36%) の時点で起きており、逐次量子化なら常駐は 7.6GB 相当のはずで**説明が
+        # つかない**。mmap したシャードのページキャッシュか HF xet の実体化が疑わしいが
+        # 未確認なので、「最悪 bf16 の実体ぶん要る」と仮定しておく。この仮定が過剰だと
+        # 分かったら実測値に置き換えること。
+        # **`none` モードではここで呼ばない**: あちらは下で `_free_transformer()` を
+        # 呼んでから TE を載せる設計なので、解放前に判定すると正常な載せ替えを誤って
+        # 拒否してしまう。`none` 側の呼び出しはその解放の直後に置いてある。
+        if TE_QUANT == "bnb-4bit":
+            _preflight_room("text_encoder (NF4 初回量子化)", _TE_CHECKPOINT_BF16_GB)
         config_kwargs = self._text_encoder_config_kwargs()
         prune_suffix = ", pruned to 51 layers" if H3_TE_PRUNE else ""
         if TE_QUANT == "bnb-4bit":
@@ -3840,6 +3903,9 @@ class MiniMaxH3Runner:
         # bf16-native, not fp32). The two big models therefore cycle: TE on GPU only
         # during prompt encoding.
         self._free_transformer()
+        # 解放**後**に判定する (上のコメント参照)。`none` モードの定常ピークは
+        # TE 66.71 + VAE 11 = 約 78GB で、transformer が退いていれば統合メモリ機でも入る。
+        _preflight_room("text_encoder (bf16)", _TE_CHECKPOINT_BF16_GB)
         if progress:
             progress.update(phase="loading_text_encoder", message=f"text_encoder (Qwen3-VL-32B{prune_suffix}) をロード中...")
         t0 = time.time()
@@ -3986,9 +4052,13 @@ class MiniMaxH3Runner:
 
         `none` mode: transformer + VAEs (the text_encoder cycles per request, so
         preloading it would only be churn).
-        `bnb-4bit` mode: transformer + text_encoder(NF4) + VAEs are ALL loaded here --
+        `bnb-4bit` mode: text_encoder(NF4) + transformer + VAEs are ALL loaded here --
         the VAEs' weights are loaded now (onto CPU, see _ensure_vaes) and the TE is
         loaded straight to GPU permanently, since nothing cycles anymore in this mode.
+        **The TE is loaded before the transformer** (2026-08-12): on a unified-memory box
+        the transformer's 66.3GB comes out of the same pool the TE's first-time
+        quantizing load needs, and loading it first got the process OOM-killed. See the
+        order comment in the body.
         `H3_LOWVRAM=1`: this mode's whole point is that TE (21GB) and transformer
         (34GB) are never GPU-resident together, so neither is preloaded here -- both
         are loaded fresh, per-request, by `generate()`/`generate_ref2va()` (see the
@@ -4008,7 +4078,22 @@ class MiniMaxH3Runner:
             if H3_LOWVRAM_GROUP:
                 self._ensure_transformer()
             elif not H3_LOWVRAM:
-                self._ensure_transformer()
+                # **TE を transformer より先にロードする (2026-08-12 に順序を入れ替え)。**
+                # 統合メモリ機 (GB10) では VRAM と RAM が同一プールなので、transformer
+                # 66.3GB を先に置くと TE のロードに残り 54.7GB しか無くなり、32B を
+                # bf16 シャードから NF4 化する初回ロード (`models/prequant/` キャッシュが
+                # まだ無い間だけ通る経路) が OOM killer に殺される -- 2026-08-12 に実際に
+                # 発生 (`Loading weights: 378/1058` で強制終了)。逆順なら TE は 119GB が
+                # 空いた状態でロードされる。
+                #
+                # **無条件に入れ替えてよい**: 定常状態の合計は順序によらず同じ
+                # (transformer 66.3 + TE 21.0 = 87.3GB) で、逆順が有利になる構成が無い。
+                # `_load_text_encoder()` の bnb-4bit 分岐と `_load_text_encoder_proj()` は
+                # どちらも transformer に触れないので、先に呼んでも副作用は無い
+                # (`_free_transformer()` を呼ぶのは `none` 分岐だけだが、`none` は下の
+                # 条件に該当せずそもそもここで preload されない)。`H3_TE_DEVICE` 指定時は
+                # TE が別GPUなので順序は元から無関係。
+                #
                 # H3_TE_PROJ (4B+投影) は bnb-4bit の 32B NF4 TE と同じ「一度ロードして
                 # 常駐させ続ける」対象 (`_free_text_encoder` の force=False no-op ガード
                 # 参照)。preload しないと最初のリクエストまで4Bロードが遅延するだけで
@@ -4016,10 +4101,9 @@ class MiniMaxH3Runner:
                 # te_proj を ON にする apply_reload_settings() の直後もこの preload_all()
                 # を通るので、この分岐がないと ON 切替の「再ロード」がTEをロードしない
                 # まま終わってしまう)。
-                if H3_TE_PROJ:
+                if H3_TE_PROJ or TE_QUANT == "bnb-4bit":
                     self._load_text_encoder()
-                elif TE_QUANT == "bnb-4bit":
-                    self._load_text_encoder()
+                self._ensure_transformer()
 
     def status(self) -> dict:
         return {
@@ -4051,9 +4135,6 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "lowvram_group": H3_LOWVRAM_GROUP,
-            # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
-            # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
-            "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
@@ -4328,9 +4409,6 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
-        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
-        # `_mux_mp4` の docstring 参照)。
-        mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
@@ -4537,10 +4615,6 @@ class MiniMaxH3Runner:
         # generation's encode+denoise+decode, not the (much larger, one-time) model
         # loading peak from a cold start.
         torch.cuda.reset_peak_memory_stats()
-        # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
-        # inside the mode-specific branches below) -- see `_apply_turbo_video_shift`'s
-        # own docstring for why per-request rather than process-wide.
-        self._apply_turbo_video_shift(instant["turbo"])
 
         pipe = self._pipe
 
@@ -5238,12 +5312,15 @@ class MiniMaxH3Runner:
         # H3_KEEP_TRANSFORMER=1: skip freeing `transformer` for the decode window too --
         # this is the flag's actual payoff (H3_LOWVRAM=1 otherwise pays the ~14.8-32.7s
         # reload cost on *every* request just to make room for the VAE pair's decode
-        # peak). Only safe because the import-time guard already forced
-        # H3_VIDEO_VAE_FP16=1: transformer-int8 34.3GB + fp16 decode peak ~11.4GB =
-        # 45.7GB fits the ~49.8GB effective budget (RESIDENCY.md §5.5). With the fp32 VAE
-        # decode peak (~16.29GB) this would be 50.6GB and would NOT fit -- which is
-        # exactly why H3_VIDEO_VAE_FP16=1 is a hard requirement of this flag, rejected at
-        # import time rather than left to fail here mid-request.
+        # peak). Only safe because the import-time guard already checked the decode
+        # phase against this GPU's measured effective budget (`_residency_requirements_gb`
+        # / `_effective_vram_budget_gb`, see the H3_KEEP_TRANSFORMER module comment):
+        # on a 48GB-class card that check is what forces H3_VIDEO_VAE_FP16=1
+        # (transformer-int8 34.3 + fp16 decode 11.4 = 45.7GB fits ~49.8GB, but the fp32
+        # decode peak 16.29GB would make it 50.6GB and would NOT -- RESIDENCY.md §5.5),
+        # while a larger box passes the same check with the fp32 peak. Either way the
+        # combination is rejected at import time rather than left to fail here
+        # mid-request.
         if H3_KEEP_TRANSFORMER:
             pass
         elif TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_GROUP:
@@ -5308,7 +5385,7 @@ class MiniMaxH3Runner:
             mode = "fl2va" if (image is not None or last_image is not None) else "t2va"
         job_stub = f"{mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
-        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
 
         # 静止画モード: 中央フレームを PNG として書き出す(超短尺 mp4 も上で保存済み。
         # 別フレームを選び直したいときは mp4 から取り出せる)。
@@ -5361,7 +5438,6 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo_lora": instant["turbo"],
             "turbo": instant["turbo"],
-            "mute": bool(mute),
             "upscale": int(do_upscale),
             "hires_denoise": H3_HIRES_DENOISE if do_upscale else None,
             "pass1_steps": n1 if do_upscale else None,
@@ -5394,9 +5470,6 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
-        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
-        # `_mux_mp4` の docstring 参照)。
-        mute: bool = False,
     ) -> dict:
         """プロンプト違いの静止画 N 枚を、`H3_LOWVRAM=1` の固定費をバッチ全体で1回に
         償却して生成する(物語の場面画像の連番生成用)。
@@ -5494,10 +5567,6 @@ class MiniMaxH3Runner:
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
         torch.cuda.reset_peak_memory_stats()
-        # バッチは場面ループの外・リクエスト先頭で1回 (全場面共通の turbo 状態 -- この
-        # メソッドはプロンプト以外のパラメータが全場面共通という前提そのもの)。以降の
-        # 場面ループ内で回る `MiniMaxH3SetTimestepsStep` より前に必ず適用しておく。
-        self._apply_turbo_video_shift(instant["turbo"])
         pipe = self._pipe
 
         # --- encode 位相: TE 常駐のまま全場面を準備 ---
@@ -5620,8 +5689,9 @@ class MiniMaxH3Runner:
         # --- decode 位相: transformer を落として VAE で全場面をデコード ---
         if progress:
             progress.update(phase="decoding", message="全場面をデコード中...")
-        # H3_KEEP_TRANSFORMER=1: generate() のデコード前分岐と同じ理由 (fp16 VAE 前提で
-        # transformer 34.3 + デコード~11.4 = 45.7GB が実効予算49.8GBに収まる導出、
+        # H3_KEEP_TRANSFORMER=1: generate() のデコード前分岐と同じ理由 (デコード位相の
+        # 所要量が実測した実効予算に収まることを import 時ガードが確認済み。48GB級なら
+        # fp16 VAE 前提で transformer 34.3 + デコード~11.4 = 45.7GB ≤ 49.8GB という導出、
         # RESIDENCY.md §5.5) でスキップ。このメソッドはバッチ全体で1回しかこの位相を
         # 通らないため、常駐維持の効果は generate() の毎リクエスト分より小さいが、
         # 挙動は同じにしておく (二重の特別扱いを避ける)。
@@ -5655,7 +5725,7 @@ class MiniMaxH3Runner:
                 # 場面ごとに保存しながら進む (途中失敗でも完了済み場面は残る)
                 job_stub = f"t2i_{int(t_start)}_s{idx + 1}"
                 mp4_path = self.output_dir / f"{job_stub}.mp4"
-                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
                 still_frame_index = len(frames_uint8) // 2
                 png_path = self.output_dir / f"{job_stub}.png"
                 Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
@@ -5713,7 +5783,6 @@ class MiniMaxH3Runner:
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
-            "mute": bool(mute),
             "scenes": results,
         }
         if progress:
@@ -5738,9 +5807,6 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
-        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
-        # `_mux_mp4` の docstring 参照)。
-        mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
@@ -5932,10 +5998,6 @@ class MiniMaxH3Runner:
         # Reset peak stats after loading so the reported peak reflects this generation's
         # encode+denoise+decode, not the (much larger, one-time) model loading peak.
         torch.cuda.reset_peak_memory_stats()
-        # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
-        # inside the mode-specific branches below) -- see `generate()`'s matching call
-        # site and `_apply_turbo_video_shift`'s own docstring.
-        self._apply_turbo_video_shift(instant["turbo"])
 
         pipe = self._pipe_ref
 
@@ -6279,7 +6341,7 @@ class MiniMaxH3Runner:
                         # the two big reloads are not competing for VRAM at the same time,
                         # mirroring generate()'s own force_free_te reload ordering.
                         self._load_text_encoder(progress)
-                    if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
+                    if H3_TRANSFORMER_BOTH_RESIDENT:
                         # Restore the int8 both-resident steady state (`transformer` +
                         # `transformer_ref` + TE-nf4 all resident) for the *next* request.
                         # `transformer` (t2va's) was freed at this method's entry to make
@@ -6360,7 +6422,7 @@ class MiniMaxH3Runner:
         ref_mode = "ref2i" if still else "ref2va"
         job_stub = f"{ref_mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
-        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
 
         # 参照付き静止画モード: 中央フレームを PNG として書き出す (generate() の still と同じ)
         png_path = None
@@ -6405,7 +6467,6 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo_lora": instant["turbo"],
             "turbo": instant["turbo"],
-            "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
@@ -6434,9 +6495,6 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
-        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
-        # `_mux_mp4` の docstring 参照)。
-        mute: bool = False,
     ) -> dict:
         """参照共通・プロンプト違いの ref2va 生成 N 本を、`H3_LOWVRAM=1` の固定費を
         バッチ全体で1回に償却して回す (`generate_still_batch()` の ref2va 版)。
@@ -6547,10 +6605,6 @@ class MiniMaxH3Runner:
             # 先に sync すると _pipe_ref.text_encoder が None のまま取り残される)。
             self._sync_shared_components_to_ref()
         torch.cuda.reset_peak_memory_stats()
-        # バッチは場面ループの外・リクエスト先頭で1回 (generate_still_batch() と同じ
-        # 理由 -- 全場面共通の turbo 状態を、以降の場面ループ内で回る
-        # `MiniMaxH3SetTimestepsStep` より前に適用しておく)。
-        self._apply_turbo_video_shift(instant["turbo"])
         pipe = self._pipe_ref
 
         # --- encode 位相 (TE 常駐): 全場面の setup + テキスト/参照ビジョンエンコード ---
@@ -6733,7 +6787,7 @@ class MiniMaxH3Runner:
 
                 job_stub = f"{'ref2i' if still else 'ref2va'}_{int(t_start)}_s{idx + 1}"
                 mp4_path = self.output_dir / f"{job_stub}.mp4"
-                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
                 png_path = None
                 still_frame_index = None
                 if still:
@@ -6796,7 +6850,6 @@ class MiniMaxH3Runner:
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
-            "mute": bool(mute),
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
@@ -6811,19 +6864,7 @@ class MiniMaxH3Runner:
         return result
 
 
-def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int, fps: int, mp4_path: Path,
-             mute: bool = False):
-    """デコード済みフレームと音声を mp4 に多重化する。
-
-    `mute=True` のときは**音声ストリームを一切作らない**(映像のみの mp4)。
-    H3 は動画と音声を同一の transformer forward で同時に生成する
-    (`denoise.py` が `audio_hidden_states` を毎ステップ渡す)omni-modal モデルなので、
-    **音声の生成そのものは止められない** -- このフラグができるのは「生成された音声を
-    出力コンテナに入れない」ところまでで、**デノイズ時間は1秒も変わらない**。
-    速度目的で使うものではなく、「確実に無音の成果物が欲しい」用途のためのもの。
-    (プロンプト側で `overall_soundscape` に無音を指示する手もあるが、実測では
-    audio_rms が 0 にはならず完全な無音は保証できない -- README 参照。)
-    """
+def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int, fps: int, mp4_path: Path):
     import av
 
     container = av.open(str(mp4_path), mode="w")
@@ -6832,10 +6873,8 @@ def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int,
     vstream.height = frames_uint8.shape[1]
     vstream.pix_fmt = "yuv420p"
 
-    astream = None
-    if not mute:
-        astream = container.add_stream("aac", rate=sampling_rate)
-        astream.layout = "stereo"
+    astream = container.add_stream("aac", rate=sampling_rate)
+    astream.layout = "stereo"
 
     for frame in frames_uint8:
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
@@ -6844,16 +6883,15 @@ def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int,
     for packet in vstream.encode():
         container.mux(packet)
 
-    if astream is not None:
-        audio_i16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)  # (2, N)
-        # av's packed s16 stereo format wants interleaved L,R,L,R,... in a (1, 2N) array, not
-        # a (2, N) per-channel block layout (verified against a manual roundtrip probe).
-        audio_interleaved = audio_i16.T.reshape(1, -1)
-        audio_frame = av.AudioFrame.from_ndarray(audio_interleaved, format="s16", layout="stereo")
-        audio_frame.sample_rate = sampling_rate
-        for packet in astream.encode(audio_frame):
-            container.mux(packet)
-        for packet in astream.encode():
-            container.mux(packet)
+    audio_i16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)  # (2, N)
+    # av's packed s16 stereo format wants interleaved L,R,L,R,... in a (1, 2N) array, not
+    # a (2, N) per-channel block layout (verified against a manual roundtrip probe).
+    audio_interleaved = audio_i16.T.reshape(1, -1)
+    audio_frame = av.AudioFrame.from_ndarray(audio_interleaved, format="s16", layout="stereo")
+    audio_frame.sample_rate = sampling_rate
+    for packet in astream.encode(audio_frame):
+        container.mux(packet)
+    for packet in astream.encode():
+        container.mux(packet)
 
     container.close()
