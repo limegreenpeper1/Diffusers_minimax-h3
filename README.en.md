@@ -217,10 +217,27 @@ chronological work log is in this README's dated sections (read on below).
 > **About the measurement environment**: this home is shared across two machines. The **96GB
 > box** = RTX PRO 6000 Blackwell 96GB + an added RTX 4060 Ti 16GB (the low-VRAM goals were
 > measured here); the **48GB box** = RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB (the
-> recommended 48GB-tier config and turbo were measured here). Each dated section states which
-> box its figures come from. A single 48GB card cannot physically load the default mode (bf16
-> transformer, 66.3GB), so `H3_LOWVRAM=1` (48GB tier) or `H3_LOWVRAM=group` (24-32GB tier) is
-> required.
+> recommended 48GB-tier config and turbo were measured here). As of 2026-08-12 a third
+> machine joined: the **GB10 box** (NVIDIA GB10 / DGX Spark, sm_121, **128.45GB of unified
+> memory**, no swap). Each dated section states which box its figures come from. A single
+> 48GB card cannot physically load the default mode (bf16 transformer, 66.3GB), so
+> `H3_LOWVRAM=1` (48GB tier) or `H3_LOWVRAM=group` (24-32GB tier) is required.
+>
+> **The GB10 box breaks one assumption the others share**: VRAM and system RAM are the same
+> pool, so the usual residency tricks ("park the VAE on the CPU") free exactly nothing there,
+> and the effective budget is also capped by `MemAvailable` (measured: 119.30GB). See the
+> unified-memory subsection of docs/RESIDENCY.md §5.2. **The VAE pair (11GB) also stays
+> GPU-resident there** (`H3_VAE_RESIDENT="auto"`): bnb-4bit's default of parking it on the
+> CPU frees nothing on one pool, and the `.to(device)` copy leaves the CPU original alive,
+> so the round trip *adds* ~11GB of pressure instead of removing it. Keeping it resident
+> costs 11GB of steady state and lowers the peak. `H3_VAE_RESIDENT=0` restores the old
+> behaviour. For speed, launch with a projected
+> TE and the transformer kept resident:
+> `H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_KEEP_TRANSFORMER=1` (85.70GB required, fp32
+> decode included). **To keep the 32B TE at bf16 instead, use `H3_TE_QUANT=none`** — that
+> mode cycles the two 66GB models through the GPU per request, so it peaks at ~78GB and
+> involves no quantization (hence no first-load peak either), at the cost of a slow swap on
+> every request. torchvision is required there (`processor` pulls in Qwen3VLVideoProcessor).
 
 ## Structure
 
